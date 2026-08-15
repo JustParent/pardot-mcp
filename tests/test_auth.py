@@ -110,6 +110,68 @@ async def test_refresh_token_read_from_cache_file(clean_env, tmp_path):
     assert json.loads(token_path.read_text())["refresh_token"] == "rotated"
 
 
+async def test_broker_token_file_supplies_everything(clean_env, tmp_path):
+    """A host-injected credential file (broker/per-user OAuth) needs no client
+    id/secret/login-url env vars: refresh_token, client_id, client_secret and
+    token_uri are all read from the file."""
+    token_path = tmp_path / "token.json"
+    clean_env.setenv("PARDOT_TOKEN_PATH", str(token_path))
+    save_cached_token(
+        token_path,
+        {
+            "refresh_token": "file-rtok",
+            "client_id": "file-cid",
+            "client_secret": "file-csecret",
+            "token_uri": "https://acme.my.salesforce.com/services/oauth2/token",
+            "token": "embedded-access-token-ignored",
+            "scopes": ["pardot_api"],
+        },
+    )
+    posted = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted["url"] = str(request.url)
+        posted["data"] = dict(pair.split("=", 1) for pair in request.content.decode().split("&"))
+        return httpx.Response(200, json={"access_token": "fresh"})
+
+    manager = OAuthTokenManager(Settings.from_env(), make_http(handler))
+    assert await manager.get_access_token() == "fresh"
+    assert posted["url"] == "https://acme.my.salesforce.com/services/oauth2/token"
+    assert posted["data"]["grant_type"] == "refresh_token"
+    assert posted["data"]["refresh_token"] == "file-rtok"
+    assert posted["data"]["client_id"] == "file-cid"
+    assert posted["data"]["client_secret"] == "file-csecret"
+
+
+async def test_env_wins_over_token_file(clean_env, tmp_path):
+    token_path = tmp_path / "token.json"
+    clean_env.setenv("PARDOT_TOKEN_PATH", str(token_path))
+    clean_env.setenv("PARDOT_CLIENT_ID", "env-cid")
+    clean_env.setenv("PARDOT_CLIENT_SECRET", "env-csecret")
+    clean_env.setenv("SALESFORCE_LOGIN_URL", "https://test.salesforce.com")
+    save_cached_token(
+        token_path,
+        {
+            "refresh_token": "file-rtok",
+            "client_id": "file-cid",
+            "client_secret": "file-csecret",
+            "token_uri": "https://acme.my.salesforce.com/services/oauth2/token",
+        },
+    )
+    posted = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        posted["url"] = str(request.url)
+        posted["data"] = dict(pair.split("=", 1) for pair in request.content.decode().split("&"))
+        return httpx.Response(200, json={"access_token": "fresh"})
+
+    manager = OAuthTokenManager(Settings.from_env(), make_http(handler))
+    assert await manager.get_access_token() == "fresh"
+    assert posted["url"] == "https://test.salesforce.com/services/oauth2/token"
+    assert posted["data"]["client_id"] == "env-cid"
+    assert posted["data"]["client_secret"] == "env-csecret"
+
+
 async def test_client_credentials_fallback(clean_env):
     clean_env.setenv("PARDOT_CLIENT_ID", "cid")
     clean_env.setenv("PARDOT_CLIENT_SECRET", "csecret")

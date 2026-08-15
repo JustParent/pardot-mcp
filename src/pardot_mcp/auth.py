@@ -9,6 +9,16 @@ Three ways to authenticate, checked in this order at server startup:
    log in once in a browser with the ``pardot-mcp-auth`` command, which caches
    a refresh token at ``PARDOT_TOKEN_PATH``
    (default ``~/.config/pardot-mcp/token.json``).
+
+   The token file is also the integration point for **hosting platforms that
+   broker per-user OAuth** (each end user connects their own Salesforce
+   account, the host injects a credential file per session and points
+   ``TOKEN_PATH`` at it). Recognized keys: ``refresh_token`` (required),
+   plus optional ``client_id`` / ``client_secret`` (used when the env vars are
+   absent) and ``token_uri`` (full token-endpoint URL, used when
+   ``SALESFORCE_LOGIN_URL`` is not explicitly set). This is a superset of the
+   Google-style ``authorized_user`` JSON shape; unknown keys are ignored, and
+   a fresh access token is always minted via the refresh grant.
 3. **Client credentials** — set only ``PARDOT_CLIENT_ID`` /
    ``PARDOT_CLIENT_SECRET`` and enable the *Client Credentials Flow* on the
    connected app (with a run-as user that has Account Engagement access).
@@ -99,20 +109,25 @@ class Settings:
     token_path: Path
     redirect_port: int
     scopes: Optional[str]
+    # True when the login URL came from the environment (as opposed to the
+    # default): an explicit env value beats a token_uri found in the token file.
+    login_url_overridden: bool = False
 
     @classmethod
     def from_env(cls) -> "Settings":
+        raw_login_url = _env("SALESFORCE_LOGIN_URL", "PARDOT_LOGIN_URL")
         return cls(
             client_id=_env("PARDOT_CLIENT_ID", "SALESFORCE_CLIENT_ID"),
             client_secret=_env("PARDOT_CLIENT_SECRET", "SALESFORCE_CLIENT_SECRET"),
             business_unit_id=_env("PARDOT_BUSINESS_UNIT_ID"),
-            login_url=(_env("SALESFORCE_LOGIN_URL", "PARDOT_LOGIN_URL", default=DEFAULT_LOGIN_URL) or "").rstrip("/"),
+            login_url=(raw_login_url or DEFAULT_LOGIN_URL).rstrip("/"),
             base_url=(_env("PARDOT_BASE_URL", default=DEFAULT_BASE_URL) or "").rstrip("/"),
             access_token=_env("PARDOT_ACCESS_TOKEN"),
             refresh_token=_env("PARDOT_REFRESH_TOKEN"),
             token_path=Path(_env("PARDOT_TOKEN_PATH", "TOKEN_PATH", default=DEFAULT_TOKEN_PATH) or DEFAULT_TOKEN_PATH).expanduser(),
             redirect_port=int(_env("PARDOT_OAUTH_REDIRECT_PORT", default=str(DEFAULT_REDIRECT_PORT)) or DEFAULT_REDIRECT_PORT),
             scopes=_env("PARDOT_OAUTH_SCOPES"),
+            login_url_overridden=raw_login_url is not None,
         )
 
 
@@ -159,8 +174,10 @@ class StaticTokenManager:
 class OAuthTokenManager:
     """Acquires and caches an access token via Salesforce OAuth.
 
-    Prefers the refresh-token grant (env var, falling back to the token cache
-    written by ``pardot-mcp-auth``), then the client-credentials grant.
+    Prefers the refresh-token grant, then the client-credentials grant. Each
+    credential resolves env-first with the token file as fallback, so both a
+    local ``pardot-mcp-auth`` login and a host-injected per-user credential
+    file (refresh_token + client_id/client_secret + token_uri) work unchanged.
     """
 
     def __init__(self, settings: Settings, http: httpx.AsyncClient):
@@ -178,53 +195,62 @@ class OAuthTokenManager:
             self._access_token = await self._acquire()
             return self._access_token
 
+    def _token_endpoint(self, cached: dict[str, Any]) -> str:
+        s = self._settings
+        if not s.login_url_overridden:
+            token_uri = cached.get("token_uri")
+            if isinstance(token_uri, str) and token_uri.startswith("https://"):
+                return token_uri
+        return f"{s.login_url}/services/oauth2/token"
+
     async def _acquire(self) -> str:
         s = self._settings
-        refresh_token = s.refresh_token
-        from_cache = False
-        if not refresh_token:
-            cached = load_cached_token(s.token_path)
-            if cached and cached.get("refresh_token"):
-                refresh_token = cached["refresh_token"]
-                from_cache = True
+        cached = load_cached_token(s.token_path) or {}
+        refresh_token = s.refresh_token or cached.get("refresh_token")
+        refresh_from_cache = not s.refresh_token and bool(cached.get("refresh_token"))
+        client_id = s.client_id or cached.get("client_id")
+        client_secret = s.client_secret or cached.get("client_secret")
+        token_endpoint = self._token_endpoint(cached)
 
         if refresh_token:
-            if not s.client_id:
+            if not client_id:
                 raise AuthError(
-                    "A refresh token is configured but PARDOT_CLIENT_ID is not "
-                    "set; the refresh-token grant needs the connected app's "
-                    "consumer key (and usually its secret)."
+                    "A refresh token is configured but no client id was found; "
+                    "the refresh-token grant needs the connected app's consumer "
+                    "key (and usually its secret). Set PARDOT_CLIENT_ID / "
+                    "PARDOT_CLIENT_SECRET, or include client_id / client_secret "
+                    "in the token file."
                 )
             data = {
                 "grant_type": "refresh_token",
-                "client_id": s.client_id,
+                "client_id": client_id,
                 "refresh_token": refresh_token,
             }
-            if s.client_secret:
-                data["client_secret"] = s.client_secret
-            token = await self._fetch_token(data)
+            if client_secret:
+                data["client_secret"] = client_secret
+            token = await self._fetch_token(token_endpoint, data)
             # Salesforce can rotate refresh tokens; keep the cache current.
             new_refresh = token.get("refresh_token")
-            if from_cache and new_refresh and new_refresh != refresh_token:
-                cached = load_cached_token(s.token_path) or {}
-                cached["refresh_token"] = new_refresh
-                save_cached_token(s.token_path, cached)
+            if refresh_from_cache and new_refresh and new_refresh != refresh_token:
+                updated = dict(cached)
+                updated["refresh_token"] = new_refresh
+                save_cached_token(s.token_path, updated)
             return token["access_token"]
 
-        if s.client_id and s.client_secret:
+        if client_id and client_secret:
             token = await self._fetch_token(
+                token_endpoint,
                 {
                     "grant_type": "client_credentials",
-                    "client_id": s.client_id,
-                    "client_secret": s.client_secret,
-                }
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                },
             )
             return token["access_token"]
 
         raise AuthError(SETUP_HELP)
 
-    async def _fetch_token(self, data: dict[str, str]) -> dict[str, Any]:
-        url = f"{self._settings.login_url}/services/oauth2/token"
+    async def _fetch_token(self, url: str, data: dict[str, str]) -> dict[str, Any]:
         response = await self._http.post(url, data=data)
         if response.status_code != 200:
             raise AuthError(_describe_token_failure(response, data["grant_type"]))

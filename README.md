@@ -113,7 +113,7 @@ token automatically (set `PARDOT_TOKEN_PATH` too if you overrode it).
 | `PARDOT_BUSINESS_UNIT_ID` | yes | 18-char business unit id (`0Uv...`), sent as the `Pardot-Business-Unit-Id` header |
 | `PARDOT_REFRESH_TOKEN` | no | Refresh token, if you'd rather paste one than use `pardot-mcp-auth` |
 | `PARDOT_ACCESS_TOKEN` | no | Static access token for quick tests (expires; no refresh) |
-| `PARDOT_TOKEN_PATH` | no | Token cache path (default `~/.config/pardot-mcp/token.json`) |
+| `PARDOT_TOKEN_PATH` | no | Token file path (default `~/.config/pardot-mcp/token.json`; alias `TOKEN_PATH`) |
 | `SALESFORCE_LOGIN_URL` | no | Default `https://login.salesforce.com`; sandboxes use `https://test.salesforce.com` |
 | `PARDOT_BASE_URL` | no | Default `https://pi.pardot.com`; AE sandbox/demo orgs use `https://pi.demo.pardot.com` |
 | `PARDOT_OAUTH_REDIRECT_PORT` | no | Local callback port for `pardot-mcp-auth` (default `8721`) |
@@ -123,6 +123,36 @@ token automatically (set `PARDOT_TOKEN_PATH` too if you overrode it).
 
 Credential resolution order at startup: `PARDOT_ACCESS_TOKEN` → refresh token
 (`PARDOT_REFRESH_TOKEN`, then the token cache) → client credentials.
+
+## Per-user OAuth via a hosting platform (token file)
+
+The token file is also the integration point for platforms that broker
+per-user OAuth — each end user connects their own Salesforce account in the
+host app, and the host launches the server per user/session with an injected
+credential file:
+
+1. Run the OAuth dance host-side against
+   `https://login.salesforce.com/services/oauth2/authorize` + `/token`
+   (scopes: `pardot_api refresh_token`), storing the user's refresh token.
+2. Per session, write a JSON credential file into the server's environment and
+   point `TOKEN_PATH` (or `PARDOT_TOKEN_PATH`) at it.
+3. Pass `PARDOT_BUSINESS_UNIT_ID` (and `PARDOT_BASE_URL` for sandbox orgs) as
+   static env vars.
+
+Recognized keys in the file:
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `refresh_token` | yes | The user's Salesforce refresh token |
+| `client_id` / `client_secret` | no | Connected app credentials; used when the `PARDOT_CLIENT_ID`/`PARDOT_CLIENT_SECRET` env vars are absent |
+| `token_uri` | no | Full token-endpoint URL (e.g. a My Domain or `test.salesforce.com` URL); used when `SALESFORCE_LOGIN_URL` is not explicitly set |
+
+Env vars always win over file values. The shape is a superset of Google-style
+`authorized_user` token JSON, so hosts that already emit that shape for other
+servers work unchanged; unknown keys (`token`, `scopes`, …) are ignored — the
+server always mints a fresh access token via the refresh grant, sending no
+`scope` parameter (so it never narrows or re-requests scopes). If Salesforce
+rotates the refresh token, the file is updated in place.
 
 ## Sandboxes / demo orgs
 
